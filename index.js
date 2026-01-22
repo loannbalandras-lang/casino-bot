@@ -18,20 +18,33 @@ const GUILD_ID = "1442149382064574598";
 const db = new Database("casino.db");
 db.pragma("journal_mode = WAL");
 
-// Users (avec monthly)
+// Users (wallet + daily + monthly + bank system + rob system)
 db.prepare(`
   CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
     wallet INTEGER NOT NULL DEFAULT 0,
+    bank INTEGER NOT NULL DEFAULT 0,
+    has_bank INTEGER NOT NULL DEFAULT 0,
+    job TEXT NOT NULL DEFAULT 'none',
+    anti_rob_until INTEGER NOT NULL DEFAULT 0,
+    rob_cooldown_until INTEGER NOT NULL DEFAULT 0,
+    bankrob_cooldown_until INTEGER NOT NULL DEFAULT 0,
     last_daily INTEGER NOT NULL DEFAULT 0,
     last_monthly INTEGER NOT NULL DEFAULT 0
   )
 `).run();
 
-// Migration si vieille DB sans last_monthly
-try {
-  db.prepare(`ALTER TABLE users ADD COLUMN last_monthly INTEGER NOT NULL DEFAULT 0`).run();
-} catch (_) { /* existe déjà */ }
+// Migrations si vieille DB (ajouts de colonnes si absentes)
+function safeAlter(sql) {
+  try { db.prepare(sql).run(); } catch (_) { /* already exists */ }
+}
+safeAlter(`ALTER TABLE users ADD COLUMN bank INTEGER NOT NULL DEFAULT 0`);
+safeAlter(`ALTER TABLE users ADD COLUMN has_bank INTEGER NOT NULL DEFAULT 0`);
+safeAlter(`ALTER TABLE users ADD COLUMN job TEXT NOT NULL DEFAULT 'none'`);
+safeAlter(`ALTER TABLE users ADD COLUMN anti_rob_until INTEGER NOT NULL DEFAULT 0`);
+safeAlter(`ALTER TABLE users ADD COLUMN rob_cooldown_until INTEGER NOT NULL DEFAULT 0`);
+safeAlter(`ALTER TABLE users ADD COLUMN bankrob_cooldown_until INTEGER NOT NULL DEFAULT 0`);
+safeAlter(`ALTER TABLE users ADD COLUMN last_monthly INTEGER NOT NULL DEFAULT 0`); // ton ancien ajout
 
 // Businesses catalog
 db.prepare(`
@@ -77,9 +90,7 @@ db.prepare(`
 `).run();
 
 // Migration safety (si ancienne DB sans "level")
-try {
-  db.prepare(`ALTER TABLE user_businesses ADD COLUMN level INTEGER NOT NULL DEFAULT 1`).run();
-} catch (_) { /* already exists */ }
+safeAlter(`ALTER TABLE user_businesses ADD COLUMN level INTEGER NOT NULL DEFAULT 1`);
 
 // Seed businesses (1 fois)
 function seedBusinesses() {
@@ -108,21 +119,43 @@ function metaSet(key, value) {
   `).run(key, value);
 }
 
+function nowMs() { return Date.now(); }
+
+// Insert user if missing + read full row
 function getUser(userId) {
   db.prepare(`INSERT OR IGNORE INTO users (user_id) VALUES (?)`).run(userId);
-  return db.prepare(`SELECT user_id, wallet, last_daily, last_monthly FROM users WHERE user_id = ?`).get(userId);
+  return db.prepare(`
+    SELECT user_id, wallet, bank, has_bank, job, anti_rob_until, rob_cooldown_until, bankrob_cooldown_until, last_daily, last_monthly
+    FROM users WHERE user_id = ?
+  `).get(userId);
 }
-function setUser(userId, wallet, lastDaily, lastMonthly) {
-  db.prepare(`UPDATE users SET wallet = ?, last_daily = ?, last_monthly = ? WHERE user_id = ?`)
-    .run(wallet, lastDaily, lastMonthly, userId);
+
+function updateUserFields(userId, fields) {
+  // fields = { wallet: 123, bank: 0, ... }
+  const keys = Object.keys(fields);
+  if (keys.length === 0) return;
+  const setSql = keys.map(k => `${k} = ?`).join(", ");
+  const values = keys.map(k => fields[k]);
+  values.push(userId);
+  db.prepare(`UPDATE users SET ${setSql} WHERE user_id = ?`).run(...values);
 }
+
 function addWallet(userId, amount) {
   const u = getUser(userId);
-  setUser(userId, u.wallet + amount, u.last_daily, u.last_monthly);
+  updateUserFields(userId, { wallet: u.wallet + amount });
 }
 function removeWallet(userId, amount) {
   const u = getUser(userId);
-  setUser(userId, u.wallet - amount, u.last_daily, u.last_monthly);
+  updateUserFields(userId, { wallet: u.wallet - amount });
+}
+
+function addBank(userId, amount) {
+  const u = getUser(userId);
+  updateUserFields(userId, { bank: u.bank + amount });
+}
+function removeBank(userId, amount) {
+  const u = getUser(userId);
+  updateUserFields(userId, { bank: u.bank - amount });
 }
 
 function listBusinesses() {
@@ -147,7 +180,7 @@ function buyBusiness(userId, businessId) {
   if (!b) return { ok: false, msg: "Entreprise introuvable." };
   if (u.wallet < b.price) return { ok: false, msg: `Pas assez de coins. Il te manque **${b.price - u.wallet}** coins.` };
 
-  setUser(userId, u.wallet - b.price, u.last_daily, u.last_monthly);
+  updateUserFields(userId, { wallet: u.wallet - b.price });
 
   db.prepare(`
     INSERT INTO user_businesses (user_id, business_id, qty, level)
@@ -190,6 +223,17 @@ const DAILY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 const MONTHLY_REWARD = 1500;
 const MONTHLY_COOLDOWN_MS = 30 * 24 * 60 * 60 * 1000; // 30 jours
+
+// Rob system
+const ROB_COOLDOWN_MS = 60 * 60 * 1000;     // 1h
+const ANTIROB_DURATION_MS = 60 * 60 * 1000; // 1h
+const BANKROB_COOLDOWN_MS = 60 * 60 * 1000; // 1h
+
+const ITEM_PRICES = {
+  antirob: 500,
+  bank: 2000,
+  job_braqueur: 3000,
+};
 
 // Slots
 const SLOT_SYMBOLS = ["🍒", "🍋", "🍇", "🔔", "⭐", "💎"];
@@ -328,12 +372,27 @@ function bjRenderState(playerCards, dealerCards, revealDealer = false) {
 }
 
 // =====================
+// ROB / BANKROB HELPERS
+// =====================
+function formatCooldown(ms) {
+  const m = Math.ceil(ms / (60 * 1000));
+  if (m <= 60) return `${m} min`;
+  const h = Math.floor(m / 60);
+  const rest = m % 60;
+  return `${h}h ${rest}min`;
+}
+
+function randomInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+// =====================
 // DISCORD BOT
 // =====================
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 const commands = [
-  new SlashCommandBuilder().setName("balance").setDescription("Voir ton argent"),
+  new SlashCommandBuilder().setName("balance").setDescription("Voir ton argent (wallet + bank)"),
 
   new SlashCommandBuilder().setName("daily").setDescription("Récupérer ta récompense quotidienne"),
   new SlashCommandBuilder().setName("monthly").setDescription("Récupérer ta récompense mensuelle (1500 coins)"),
@@ -382,6 +441,43 @@ const commands = [
 
   new SlashCommandBuilder().setName("hit").setDescription("Blackjack: Piocher une carte"),
   new SlashCommandBuilder().setName("stand").setDescription("Blackjack: Rester et laisser jouer le dealer"),
+
+  // ✅ NEW: shop items
+  new SlashCommandBuilder()
+    .setName("buyitem")
+    .setDescription("Acheter: antirob | bank | job_braqueur")
+    .addStringOption(opt =>
+      opt.setName("item")
+        .setDescription("Objet à acheter")
+        .setRequired(true)
+        .addChoices(
+          { name: `Anti-Rob 🛡️ (${ITEM_PRICES.antirob} coins)`, value: "antirob" },
+          { name: `Banque 🏦 (${ITEM_PRICES.bank} coins)`, value: "bank" },
+          { name: `Job Braqueur 🥷 (${ITEM_PRICES.job_braqueur} coins)`, value: "job_braqueur" },
+        )
+    ),
+
+  // ✅ NEW: deposit/withdraw
+  new SlashCommandBuilder()
+    .setName("deposit")
+    .setDescription("Déposer des coins en banque (protégé contre /rob)")
+    .addIntegerOption(opt => opt.setName("montant").setDescription("Montant").setRequired(true).setMinValue(1)),
+
+  new SlashCommandBuilder()
+    .setName("withdraw")
+    .setDescription("Retirer des coins de la banque")
+    .addIntegerOption(opt => opt.setName("montant").setDescription("Montant").setRequired(true).setMinValue(1)),
+
+  // ✅ NEW: rob & bankrob
+  new SlashCommandBuilder()
+    .setName("rob")
+    .setDescription("Voler un joueur (cooldown 1h)")
+    .addUserOption(opt => opt.setName("joueur").setDescription("Victime").setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName("bankrob")
+    .setDescription("Braquer la banque d'un joueur (job braqueur, cooldown 1h)")
+    .addUserOption(opt => opt.setName("joueur").setDescription("Cible").setRequired(true)),
 ].map(c => c.toJSON());
 
 client.once("ready", async () => {
@@ -412,10 +508,13 @@ client.on("interactionCreate", async (interaction) => {
 
   const userId = interaction.user.id;
 
-  // /balance
+  // /balance (wallet + bank + protections)
   if (interaction.commandName === "balance") {
     const u = getUser(userId);
-    return interaction.reply(`💰 Tu as **${u.wallet}** coins.`);
+    const protectedTxt = u.anti_rob_until > nowMs() ? "🛡️ Anti-Rob: **ACTIF**" : "🛡️ Anti-Rob: inactif";
+    const jobTxt = u.job === "braqueur" ? "🥷 Job: **Braqueur**" : "👤 Job: none";
+    const bankTxt = u.has_bank ? `🏦 Banque: **${u.bank}** coins` : "🏦 Banque: non achetée";
+    return interaction.reply(`💰 Wallet: **${u.wallet}** coins\n${bankTxt}\n${protectedTxt}\n${jobTxt}`);
   }
 
   // /daily
@@ -432,11 +531,11 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     const newWallet = u.wallet + DAILY_REWARD;
-    setUser(userId, newWallet, now, u.last_monthly);
-    return interaction.reply(`🎁 Daily récupéré : **+${DAILY_REWARD}** coins ! (Total: **${newWallet}**)`);
+    updateUserFields(userId, { wallet: newWallet, last_daily: now });
+    return interaction.reply(`🎁 Daily récupéré : **+${DAILY_REWARD}** coins ! (Total wallet: **${newWallet}**)`);
   }
 
-  // ✅ /monthly (1500)
+  // /monthly (1500)
   if (interaction.commandName === "monthly") {
     const u = getUser(userId);
     const now = Date.now();
@@ -450,8 +549,8 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     const newWallet = u.wallet + MONTHLY_REWARD;
-    setUser(userId, newWallet, u.last_daily, now);
-    return interaction.reply(`🗓️ Monthly récupéré : **+${MONTHLY_REWARD}** coins ! (Total: **${newWallet}**)`);
+    updateUserFields(userId, { wallet: newWallet, last_monthly: now });
+    return interaction.reply(`🗓️ Monthly récupéré : **+${MONTHLY_REWARD}** coins ! (Total wallet: **${newWallet}**)`);
   }
 
   // /coinflip
@@ -462,12 +561,12 @@ client.on("interactionCreate", async (interaction) => {
 
     const win = Math.random() < 0.5;
     const newWallet = win ? (u.wallet + bet) : (u.wallet - bet);
-    setUser(userId, newWallet, u.last_daily, u.last_monthly);
+    updateUserFields(userId, { wallet: newWallet });
 
     return interaction.reply(
       win
-        ? `🪙 **Gagné !** Tu gagnes **+${bet}** coins. Total: **${newWallet}**`
-        : `🪙 **Perdu...** Tu perds **-${bet}** coins. Total: **${newWallet}**`
+        ? `🪙 **Gagné !** Tu gagnes **+${bet}** coins. Total wallet: **${newWallet}**`
+        : `🪙 **Perdu...** Tu perds **-${bet}** coins. Total wallet: **${newWallet}**`
     );
   }
 
@@ -482,15 +581,15 @@ client.on("interactionCreate", async (interaction) => {
     const payout = computeSlotPayout(bet, roll);
     walletAfterBet += payout;
 
-    setUser(userId, walletAfterBet, u.last_daily, u.last_monthly);
+    updateUserFields(userId, { wallet: walletAfterBet });
 
     const [a, b, c] = roll;
     const line = `🎰 **[ ${a} | ${b} | ${c} ]**`;
 
-    if (payout === 0) return interaction.reply(`${line}\n❌ Perdu… Tu perds **-${bet}** coins. Total: **${walletAfterBet}**`);
-    if (payout === bet * 5) return interaction.reply(`${line}\n💎💎💎 **JACKPOT !** Tu gagnes **+${payout - bet}** coins ! Total: **${walletAfterBet}**`);
-    if (payout === bet * 3) return interaction.reply(`${line}\n🔥 **TRIPLÉ !** Tu gagnes **+${payout - bet}** coins ! Total: **${walletAfterBet}**`);
-    return interaction.reply(`${line}\n✅ **Double !** Tu gagnes **+${payout - bet}** coins ! Total: **${walletAfterBet}**`);
+    if (payout === 0) return interaction.reply(`${line}\n❌ Perdu… Tu perds **-${bet}** coins. Total wallet: **${walletAfterBet}**`);
+    if (payout === bet * 5) return interaction.reply(`${line}\n💎💎💎 **JACKPOT !** Tu gagnes **+${payout - bet}** coins ! Total wallet: **${walletAfterBet}**`);
+    if (payout === bet * 3) return interaction.reply(`${line}\n🔥 **TRIPLÉ !** Tu gagnes **+${payout - bet}** coins ! Total wallet: **${walletAfterBet}**`);
+    return interaction.reply(`${line}\n✅ **Double !** Tu gagnes **+${payout - bet}** coins ! Total wallet: **${walletAfterBet}**`);
   }
 
   // /leaderboard
@@ -509,7 +608,7 @@ client.on("interactionCreate", async (interaction) => {
       return `${medal} **${idx + 1}.** <@${row.user_id}> — **${row.wallet}** coins`;
     });
 
-    return interaction.reply(`🏆 **Leaderboard (Top 10)**\n\n${lines.join("\n")}`);
+    return interaction.reply(`🏆 **Leaderboard (Top 10 wallet)**\n\n${lines.join("\n")}`);
   }
 
   // /shop
@@ -521,7 +620,7 @@ client.on("interactionCreate", async (interaction) => {
     return interaction.reply(`🏪 **Shop des entreprises**\n\n${text}\n\n➡️ Acheter : **/buy id:<numéro>**`);
   }
 
-  // /buy
+  // /buy (entreprises)
   if (interaction.commandName === "buy") {
     const id = interaction.options.getInteger("id", true);
     const result = buyBusiness(userId, id);
@@ -531,7 +630,7 @@ client.on("interactionCreate", async (interaction) => {
     const income = calcIncomePerHourForUser(userId);
     return interaction.reply(
       `✅ Achat réussi : **${result.business.name}**\n` +
-      `💰 Il te reste : **${u.wallet}** coins\n` +
+      `💰 Wallet restant : **${u.wallet}** coins\n` +
       `📈 Tes revenus total : **${income}/h**`
     );
   }
@@ -569,7 +668,7 @@ client.on("interactionCreate", async (interaction) => {
     const cost = upgradeCost(owned.price, owned.level);
     if (u.wallet < cost) return replyEphemeral(interaction, `❌ Pas assez de coins. Il te manque **${cost - u.wallet}** coins.`);
 
-    setUser(userId, u.wallet - cost, u.last_daily, u.last_monthly);
+    updateUserFields(userId, { wallet: u.wallet - cost });
     db.prepare(`UPDATE user_businesses SET level = level + 1 WHERE user_id = ? AND business_id = ?`).run(userId, id);
 
     const newLevel = owned.level + 1;
@@ -581,7 +680,7 @@ client.on("interactionCreate", async (interaction) => {
       `⬆️ Upgrade réussi : **${owned.name}**\n` +
       `⭐ Niveau : **${newLevel}/10** (x${mult.toFixed(1)})\n` +
       `💸 Coût : **${cost}** coins\n` +
-      `💰 Il te reste : **${newWallet}** coins\n` +
+      `💰 Wallet restant : **${newWallet}** coins\n` +
       `📈 Tes revenus total : **${totalIncome}/h**`
     );
   }
@@ -597,7 +696,7 @@ client.on("interactionCreate", async (interaction) => {
 
     addWallet(target.id, amount);
     const newBal = getUser(target.id).wallet;
-    return interaction.reply(`✅ **Admin** a donné **${amount}** coins à <@${target.id}>. (Nouveau solde: **${newBal}**)`);
+    return interaction.reply(`✅ **Admin** a donné **${amount}** coins à <@${target.id}>. (Nouveau wallet: **${newBal}**)`);
   }
 
   // /pay
@@ -615,10 +714,161 @@ client.on("interactionCreate", async (interaction) => {
     addWallet(target.id, amount);
 
     const senderNew = getUser(userId).wallet;
-    return interaction.reply(`✅ <@${userId}> a envoyé **${amount}** coins à <@${target.id}>.\n💰 Ton nouveau solde: **${senderNew}**`);
+    return interaction.reply(`✅ <@${userId}> a envoyé **${amount}** coins à <@${target.id}>.\n💰 Ton nouveau wallet: **${senderNew}**`);
   }
 
-  // 🃏 BLACKJACK
+  // =====================
+  // ✅ NEW: /buyitem
+  // =====================
+  if (interaction.commandName === "buyitem") {
+    const item = interaction.options.getString("item", true);
+    const u = getUser(userId);
+
+    const price = ITEM_PRICES[item];
+    if (!price) return replyEphemeral(interaction, "❌ Item invalide.");
+
+    if (u.wallet < price) return replyEphemeral(interaction, `❌ Pas assez de coins. Il te manque **${price - u.wallet}** coins.`);
+
+    // BANK
+    if (item === "bank") {
+      if (u.has_bank) return replyEphemeral(interaction, "🏦 Tu as déjà une banque.");
+      updateUserFields(userId, { wallet: u.wallet - price, has_bank: 1 });
+      return interaction.reply(`🏦 Banque achetée ! Tu peux maintenant utiliser **/deposit** et **/withdraw**.`);
+    }
+
+    // ANTIROB
+    if (item === "antirob") {
+      updateUserFields(userId, {
+        wallet: u.wallet - price,
+        anti_rob_until: nowMs() + ANTIROB_DURATION_MS,
+      });
+      return interaction.reply(`🛡️ Anti-Rob activé pendant **1h** ! (bloque /rob et /bankrob)`);
+    }
+
+    // JOB BRAQUEUR
+    if (item === "job_braqueur") {
+      updateUserFields(userId, { wallet: u.wallet - price, job: "braqueur" });
+      return interaction.reply(`🥷 Job acheté : tu es maintenant **Braqueur** ! Tu peux utiliser **/bankrob**.`);
+    }
+  }
+
+  // =====================
+  // ✅ NEW: /deposit
+  // =====================
+  if (interaction.commandName === "deposit") {
+    const amount = interaction.options.getInteger("montant", true);
+    const u = getUser(userId);
+
+    if (!u.has_bank) return replyEphemeral(interaction, "🏦 Tu n’as pas de banque. Achète-la avec **/buyitem bank**.");
+    if (amount > u.wallet) return replyEphemeral(interaction, `❌ Pas assez dans ton wallet. Tu as **${u.wallet}** coins.`);
+    if (amount <= 0) return replyEphemeral(interaction, "❌ Montant invalide.");
+
+    updateUserFields(userId, { wallet: u.wallet - amount, bank: u.bank + amount });
+    const nu = getUser(userId);
+    return interaction.reply(`🏦 Dépôt réussi : **${amount}** coins.\n💰 Wallet: **${nu.wallet}** | 🏦 Bank: **${nu.bank}**`);
+  }
+
+  // =====================
+  // ✅ NEW: /withdraw
+  // =====================
+  if (interaction.commandName === "withdraw") {
+    const amount = interaction.options.getInteger("montant", true);
+    const u = getUser(userId);
+
+    if (!u.has_bank) return replyEphemeral(interaction, "🏦 Tu n’as pas de banque.");
+    if (amount > u.bank) return replyEphemeral(interaction, `❌ Pas assez en banque. Tu as **${u.bank}** coins.`);
+    if (amount <= 0) return replyEphemeral(interaction, "❌ Montant invalide.");
+
+    updateUserFields(userId, { bank: u.bank - amount, wallet: u.wallet + amount });
+    const nu = getUser(userId);
+    return interaction.reply(`💸 Retrait réussi : **${amount}** coins.\n💰 Wallet: **${nu.wallet}** | 🏦 Bank: **${nu.bank}**`);
+  }
+
+  // =====================
+  // ✅ NEW: /rob
+  // =====================
+  if (interaction.commandName === "rob") {
+    const target = interaction.options.getUser("joueur", true);
+    if (target.bot) return replyEphemeral(interaction, "❌ Tu ne peux pas voler un bot.");
+    if (target.id === userId) return replyEphemeral(interaction, "❌ Tu ne peux pas te voler toi-même.");
+
+    const me = getUser(userId);
+    const victim = getUser(target.id);
+
+    // cooldown
+    if (me.rob_cooldown_until > nowMs()) {
+      const remaining = me.rob_cooldown_until - nowMs();
+      return replyEphemeral(interaction, `⏳ Cooldown /rob. Reviens dans **${formatCooldown(remaining)}**.`);
+    }
+
+    // antirob
+    if (victim.anti_rob_until > nowMs()) {
+      updateUserFields(userId, { rob_cooldown_until: nowMs() + ROB_COOLDOWN_MS });
+      return interaction.reply(`🛡️ ${target.username} est protégé par **Anti-Rob** ! Vol bloqué (cooldown 1h appliqué).`);
+    }
+
+    if (victim.wallet <= 0) {
+      updateUserFields(userId, { rob_cooldown_until: nowMs() + ROB_COOLDOWN_MS });
+      return interaction.reply(`😶 ${target.username} n'a rien sur lui (wallet vide).`);
+    }
+
+    // vole 10% à 35% du wallet
+    const min = Math.max(1, Math.floor(victim.wallet * 0.10));
+    const max = Math.max(1, Math.floor(victim.wallet * 0.35));
+    const stolen = randomInt(min, max);
+
+    updateUserFields(target.id, { wallet: victim.wallet - stolen });
+    updateUserFields(userId, { wallet: me.wallet + stolen, rob_cooldown_until: nowMs() + ROB_COOLDOWN_MS });
+
+    return interaction.reply(`🥷 Tu as volé **${stolen} coins** à ${target.username} !`);
+  }
+
+  // =====================
+  // ✅ NEW: /bankrob
+  // =====================
+  if (interaction.commandName === "bankrob") {
+    const target = interaction.options.getUser("joueur", true);
+    if (target.bot) return replyEphemeral(interaction, "❌ Tu ne peux pas braquer un bot.");
+    if (target.id === userId) return replyEphemeral(interaction, "❌ Tu ne peux pas te braquer toi-même.");
+
+    const me = getUser(userId);
+    const victim = getUser(target.id);
+
+    if (me.job !== "braqueur") {
+      return replyEphemeral(interaction, "❌ Tu dois être **Braqueur**. Achète le job avec **/buyitem job_braqueur**.");
+    }
+
+    // cooldown
+    if (me.bankrob_cooldown_until > nowMs()) {
+      const remaining = me.bankrob_cooldown_until - nowMs();
+      return replyEphemeral(interaction, `⏳ Cooldown /bankrob. Reviens dans **${formatCooldown(remaining)}**.`);
+    }
+
+    // antirob bloque aussi
+    if (victim.anti_rob_until > nowMs()) {
+      updateUserFields(userId, { bankrob_cooldown_until: nowMs() + BANKROB_COOLDOWN_MS });
+      return interaction.reply(`🛡️ ${target.username} est protégé par **Anti-Rob** ! Braquage bloqué (cooldown 1h appliqué).`);
+    }
+
+    if (!victim.has_bank || victim.bank <= 0) {
+      updateUserFields(userId, { bankrob_cooldown_until: nowMs() + BANKROB_COOLDOWN_MS });
+      return interaction.reply(`🏦 ${target.username} n'a pas (ou plus) d'argent en banque.`);
+    }
+
+    // braquage: 5% à 15% de la bank
+    const min = Math.max(1, Math.floor(victim.bank * 0.05));
+    const max = Math.max(1, Math.floor(victim.bank * 0.15));
+    const stolen = randomInt(min, max);
+
+    updateUserFields(target.id, { bank: victim.bank - stolen });
+    updateUserFields(userId, { wallet: me.wallet + stolen, bankrob_cooldown_until: nowMs() + BANKROB_COOLDOWN_MS });
+
+    return interaction.reply(`💥 Braquage réussi ! Tu as pris **${stolen} coins** dans la banque de ${target.username}.`);
+  }
+
+  // =====================
+  // 🃏 BLACKJACK (TON CODE)
+  // =====================
   if (interaction.commandName === "blackjack") {
     const bet = interaction.options.getInteger("mise", true);
     const u = getUser(userId);
@@ -705,7 +955,7 @@ client.on("interactionCreate", async (interaction) => {
     const msg =
       bjRenderState(game.player_cards, game.dealer_cards, true) +
       `\n${resultText}\n` +
-      `💰 Nouveau solde: **${newBal}** coins`;
+      `💰 Nouveau wallet: **${newBal}** coins`;
 
     return interaction.reply(msg);
   }
